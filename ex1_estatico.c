@@ -65,10 +65,11 @@ void *conta_bloco(void *p)
 
     long long meus_primos = 0;
 
-    /* TODO (b): para cada k de a->k_ini até a->k_fim - 1, gere o número
-     * com valor(k), teste com eh_primo e acumule em meus_primos.
-     * Repare: acumulamos numa variável LOCAL e só copiamos para a struct
-     * no final — a mesma estratégia da versão (c) da atividade anterior. */
+    /* (b) Testa cada número do bloco desta thread. A contagem vai para
+     * uma variável local; só copio para a struct no fim. */
+    for (long long k = a->k_ini; k < a->k_fim; k++)
+        if (eh_primo(valor(k)))
+            meus_primos++;
 
     a->primos = meus_primos;
     a->tempo  = agora() - t0;
@@ -91,18 +92,33 @@ int main(int argc, char **argv)
     args_t    args[64] = {{0}};
     double    t_ini = agora();
 
-    (void)th; /* evita aviso do compilador enquanto o TODO (a) não está
-                 feito; esta linha pode ser removida depois. */
+    /* (a) Divide a lista em T blocos contíguos. Se K não for múltiplo de
+     * T, as primeiras (K % T) threads ficam com um índice a mais. */
+    long long base  = K / T;        /* tamanho mínimo de cada bloco    */
+    long long resto = K % T;        /* quantas threads levam +1 índice */
+    long long k = 0;
 
-    /* TODO (a): preencha args[i] para cada thread i (id e os limites
-     * k_ini/k_fim do seu bloco contíguo — cuidado para cobrir TODOS os
-     * K índices quando K não for múltiplo de T; com T = 4 os blocos são
-     * 0..8191, 8192..16383, 16384..24575, 24576..32767) e crie as
-     * threads com pthread_create, passando &args[i]. */
+    for (int i = 0; i < T; i++) {
+        long long tamanho = base + (i < resto ? 1 : 0);
 
-    /* TODO (c): espere as threads com pthread_join e some os resultados
-     * parciais args[i].primos em total. */
+        args[i].id     = i;
+        args[i].k_ini  = k;
+        args[i].k_fim  = k + tamanho;   /* um além do último índice */
+        args[i].primos = 0;
+        args[i].tempo  = 0.0;
+        k = args[i].k_fim;
+
+        pthread_create(&th[i], NULL, conta_bloco, &args[i]);
+    }
+
+    /* (c) Espera as threads e soma os parciais. É o join que garante que
+     * args[i].primos já foi escrito — por isso não precisa de mutex. */
     long long total = 0;
+    for (int i = 0; i < T; i++) {
+        pthread_join(th[i], NULL);
+        total += args[i].primos;   /* Q4: é aqui que os parciais se
+                                    * encontram pela primeira vez */
+    }
 
     double t_total = agora() - t_ini;
 

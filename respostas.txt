@@ -1,0 +1,341 @@
+Atividade Pratica - Bag-of-Tasks com pthreads
+Computacao de Alto Desempenho - Unisinos
+Aluno: Kevin de Azevedo Garcia
+
+Maquina das medicoes: Intel Core Ultra 9 185H, rodando em VM. Fixei os
+programas em 2 nucleos com "taskset -c 0,1 ./programa <T>", entao o speedup
+maximo possivel aqui e 2. Compilado com gcc -Wall -O2 -pthread.
+Todas as execucoes deram 3025 primos. Rodei tudo 2 vezes e usei a media,
+porque o tempo varia bastante nessa maquina (com 1 thread deu 57,83 e 51,41 s).
+
+
+PARTE 0
+
+Q1. Troquei o while por if e rodei 5 vezes: funcionou todas. Mas e sorte
+desse exemplo, que tem um produtor so, usa signal (acorda uma thread por vez) e
+tem 100 ms de usleep em cada consumidor, entao quase nunca duas threads
+disputam o mutex. O while e obrigatorio por dois motivos:
+
+1) Acordadas espurias: o POSIX permite que cond_wait volte sem ninguem ter
+   chamado signal. Acordar nao quer dizer que a condicao ficou verdadeira.
+
+2) O que acontece entre acordar e pegar o mutex de volta. O cond_wait so
+   retorna depois de readquirir o mutex, e nesse meio tempo a thread e so mais
+   uma na fila do mutex. Entao o produtor insere 1 item e da signal acordando o
+   consumidor A; antes de A pegar o mutex, o consumidor B chega em retira(),
+   pega o mutex primeiro e leva o item; A pega o mutex e a fila esta vazia de
+   novo. Com if, A nao reconfere e retira de fila vazia: le lixo em
+   itens[inicio] e faz tam virar -1. Com while ele so volta a dormir.
+
+Pra provar, fiz uma versao da mesma fila com 8 consumidores, sem usleep e
+com broadcast no lugar de signal (trocar signal por broadcast e sempre valido).
+Contei quantas vezes uma thread saiu do wait com a fila ainda vazia:
+
+    com if   : 898, 1279, 1060, 907, 1353
+    com while:   0,    0,    0,   0,    0
+
+Ou seja, parecer que funciona nao e estar correto. Desfiz a alteracao.
+
+Q2. Ao dormir o cond_wait libera o mutex, junto com o ato de dormir, numa
+operacao so. Ao acordar ele pega o mutex de volta antes de retornar, por isso
+da pra mexer nas variaveis compartilhadas logo depois do wait sem lock nenhum.
+
+Se dormisse segurando o mutex daria deadlock na hora: a thread dorme esperando
+a condicao mudar, mas quem mudaria a condicao precisa do mutex, e o mutex esta
+na mao de quem esta dormindo.
+
+Ser uma operacao unica tambem importa: se fosse "solta o mutex" e depois
+"dorme", o produtor poderia entrar no meio, inserir e dar signal antes da thread
+dormir. Como variavel de condicao nao guarda sinal, esse signal se perderia e a
+thread dormiria pra sempre (lost wakeup).
+
+Q3. Pela tarefa FIM (-1), o poison pill: depois das 20 tarefas o produtor
+insere 3 FIM, um por consumidor. O FIM passa pela propria fila, entao pela
+ordem FIFO so e retirado depois de todas as tarefas reais (uma flag global
+"acabou" nao serviria, porque um consumidor poderia ver a flag e sair com
+tarefas ainda na fila). E precisa ser um por consumidor, porque cada FIM e
+consumido por uma thread so.
+
+Comentei a insercao dos FIM e rodei com timeout 5: codigo de saida 124 (o
+timeout teve que matar o processo), nenhuma linha "FIM recebido" e nenhuma
+linha final do produtor. As 20 tarefas sao processadas e ai o programa trava.
+Trava porque a fila fica vazia pra sempre (o produtor ja terminou), os 3
+consumidores dormem no cond_wait(&nao_vazia) e nao existe mais ninguem pra dar
+signal nessa condicao, enquanto a main fica parada no join esperando threads
+que nunca vao acabar. Desfiz a alteracao.
+
+
+PARTE 1 - PARTICIONAMENTO ESTATICO
+
+Q4. Compartilhado: os vetores args[64] e th[64], e as funcoes valor() e
+eh_primo(), que sao puras. A lista em si nao e compartilhada porque nunca
+existe na memoria: cada thread recalcula o numero com valor(k) na hora.
+Local de cada thread: meus_primos (ex1_estatico.c:66), o k do laco e o t0.
+
+Nao precisa de mutex porque nenhuma posicao de memoria recebe escrita de duas
+threads. Durante o processamento cada thread so escreve em meus_primos, que e
+local dela. No fim a thread i escreve em args[i], e so nesse elemento: mesmo
+vetor, mas nunca a mesma posicao. E a main so le args[i].primos depois do
+pthread_join, que alem de esperar garante que o que a thread escreveu ja esta
+visivel. A sincronizacao existe, so que ja vem de graca no join.
+
+Os resultados parciais se encontram pela primeira vez em:
+
+    ex1_estatico.c:127     total += args[i].primos;
+
+no laco de join, na main. A linha anterior e o proprio pthread_join, que e o
+que torna essa leitura segura.
+
+Tabela 1 - particionamento estatico
+
+    Threads   Tempo total (s)   Speedup = T1/Tn
+       1           54,62              1,00
+       2           39,82              1,37
+       4           27,86              1,96
+
+    (media de 2 execucoes: 57,83/51,41, 40,15/39,49, 27,27/28,45)
+
+Com 2 threads em 2 nucleos, que e o caso limpo de uma thread por nucleo, o
+speedup foi so 1,37. Ficou quase um terco abaixo do possivel, e nao por causa
+de sincronizacao (nao tem nenhuma no programa), e sim por desbalanceamento.
+
+O 1,96 com 4 threads nao e merito do programa: com 4 threads em 2 nucleos o
+escalonador do SO reveza as threads e acaba balanceando sem querer. Numa
+maquina com 4 nucleos de verdade esse revezamento nao existiria e o
+desbalanceamento apareceria inteiro.
+
+Tempos individuais (rep 1 / rep 2):
+
+  2 threads:
+    Thread 0 (k = 0 a 16383):     1605 primos em 16,41 s / 14,55 s
+    Thread 1 (k = 16384 a 32767): 1420 primos em 40,15 s / 39,49 s
+
+  4 threads:
+    Thread 0 (k = 0 a 8191):       828 primos em  7,50 s /  7,77 s
+    Thread 1 (k = 8192 a 16383):   777 primos em 21,12 s / 21,99 s
+    Thread 2 (k = 16384 a 24575):  731 primos em 27,27 s / 28,45 s
+    Thread 3 (k = 24576 a 32767):  689 primos em 25,97 s / 26,99 s
+
+Com 4 threads os tempos nao crescem certinho porque as 4 disputam 2 nucleos,
+entao o tempo individual mistura desbalanceamento com revezamento. A medida
+limpa e a de 2 threads: mesma quantidade de numeros, 2,4x de diferenca.
+
+Q5. Cada thread recebeu a mesma quantidade de numeros, mas isso nao e a mesma
+quantidade de trabalho. O custo de eh_primo(v) varia por dois motivos:
+
+(i) O custo cresce com k. O laco vai de 3 ate sqrt(v) de 2 em 2, ou seja
+    sqrt(v)/2 iteracoes no pior caso. Como v(k) = 1e9+1 + 600000*k^2,
+    sqrt(v(k)) fica perto de 775*k, entao o pior caso cresce linear com k:
+    em k=8191 sao ~3,2 milhoes de passos e em k=32767 sao ~12,7 milhoes. Como o
+    custo do bloco e a soma disso, ele cresce mais ou menos com o quadrado da
+    posicao. Bateu com o medido: bloco 0 em ~7,6 s e os ultimos em ~27-28 s.
+
+(ii) O custo de cada numero e imprevisivel. Se v tem fator pequeno o laco morre
+     logo (multiplo de 3 custa 1 iteracao); se v e primo grande vai ate o fim.
+     Sao 6 ou 7 ordens de grandeza de diferenca e so da pra saber testando.
+     Repare que a thread 0 achou mais primos (828) e ainda foi a mais rapida:
+     os primos dela eram pequenos e baratos. Nem a quantidade de primos serve
+     como estimativa de custo.
+
+O tempo do programa e o tempo da thread mais lenta. Com 2 threads a thread 0
+terminou e ficou uns 24 s parada, 61% do tempo de parede, com um nucleo inteiro
+sem fazer nada. E isso que trava o speedup em 1,37.
+
+Duas melhorias sem usar fila:
+
+1) Distribuicao ciclica: a thread i pega k = i, i+T, i+2T, ... Na pratica so
+   muda o laco pra "for (long long k = a->id; k < K; k += T)". Cada thread
+   recebe uma amostra espalhada pela lista inteira, com a mesma mistura de
+   numeros baratos do inicio e caros do fim.
+
+2) Blocos de tamanhos diferentes, ponderados pelo custo estimado. Como o custo
+   de pior caso e proporcional a k e a soma de k cresce com k^2, os cortes
+   ficariam em k_i = K*sqrt(i/T): com T=4 daria mais ou menos 0..16383,
+   16384..23169, 23170..28377, 28378..32767, o primeiro bloco com metade da
+   lista e o ultimo com so 13%. Versao mais simples da mesma ideia: dividir em
+   2T blocos e dar pra cada thread um do inicio e um do fim.
+
+Limitacao: as duas so atacam o item (i). Elas sao decididas antes de rodar e
+nunca mais mudam, entao se a estimativa errar nao tem conserto - a thread que
+acabar cedo nao consegue ajudar a sobrecarregada, mesmo com o nucleo parado. A
+melhoria 2 ainda depende de um modelo de custo, e o unico modelo que da pra
+montar e o de pior caso; o custo real depende de o numero ser primo, que e justamente o que o
+programa esta tentando descobrir. A melhoria 1 funciona aqui porque o custo
+varia suave com k, mas e uma aposta: se os numeros caros estivessem agrupados
+com periodo multiplo de T, daria o mesmo desbalanceamento (numa lista em que
+todo indice multiplo de 4 fosse caro, com T=4 a thread 0 pegaria todo o
+trabalho pesado). Particionamento estatico so e tao bom quanto a previsao de
+custo que ele usa.
+
+
+PARTE 2 - BAG-OF-TASKS
+
+Tabela 2 - bag-of-tasks
+
+    Threads   Tempo total (s)   Speedup = T1(Tab.1)/Tn
+       1           53,13              1,03
+       2           28,75              1,90
+       4           27,48              1,99
+
+    (media de 2 execucoes: 51,50/54,75, 28,94/28,56, 27,77/27,18)
+    (base: T1 = 54,62 s da Tabela 1)
+
+Tempos e tarefas por thread:
+
+  2 threads:  Thread 0: 1506 primos em 28,93 s (16249 tarefas)
+              Thread 1: 1519 primos em 28,94 s (16519 tarefas)
+
+  4 threads:  Thread 0: 918 primos em 27,16 s (9643 tarefas)
+              Thread 1: 674 primos em 27,17 s (7360 tarefas)
+              Thread 2: 653 primos em 27,18 s (7493 tarefas)
+              Thread 3: 780 primos em 27,15 s (8272 tarefas)
+
+Esse e o ponto principal: as threads executaram quantidades bem diferentes de
+tarefas (de 7360 a 9643, 31% de diferenca) e mesmo assim terminaram
+praticamente juntas, com 0,03 s de diferenca. A quantidade de tarefas se ajusta
+sozinha ao custo delas - quem pega tarefa barata volta mais vezes na fila e
+leva mais numero embora. O programa nao balanceia a carga, ela se balanceia
+sozinha. Na Tabela 1 as threads receberam a mesma quantidade de numeros e
+terminaram com ate 3,6x de diferenca.
+
+Com 1 thread da empate com o estatico (53,13 contra 54,62, dentro do ruido), o
+que faz sentido: com uma trabalhadora so nao tem carga pra equilibrar. Mostra
+que o custo da fila e desprezivel, ja que o bag nao perde nada.
+
+Q6. Mestre: a main (ex2_bag.c:157), que cria as trabalhadoras, percorre a lista
+inserindo cada numero na fila e no fim insere um FIM pra cada trabalhadora. Ela
+nao testa primalidade, so distribui e encerra.
+Trabalhadoras: as T threads que rodam trabalhadora() (ex2_bag.c:120), no laco
+"retira, se for FIM para, senao testa e acumula, volta pra fila". Nenhuma sabe
+de antemao quais numeros vai pegar nem quantos.
+Sacola: o buffer circular itens[CAP_FILA] com inicio, tras e tam
+(ex2_bag.c:56-59), com o mutex_fila e as condicoes nao_vazia e nao_cheia. Ser
+limitada importa: o mestre bloqueia quando enche, entao a memoria e constante e
+as tarefas sao produzidas no ritmo em que sao consumidas.
+
+Agregacao: durante o laco cada trabalhadora acumula em meus_primos, que e
+local, sem tocar em mutex. No fim faz uma unica secao critica
+(ex2_bag.c:145-147) somando em total_primos com o mutex_total - sao T secoes
+criticas no programa inteiro, e nao uma por numero testado. Usei um mutex
+separado do mutex_fila porque sao recursos independentes. Diferente do
+Exercicio 1, aqui o mutex e obrigatorio porque as T threads escrevem no mesmo
+endereco: sem ele o += perderia atualizacoes e o total mudaria entre execucoes.
+
+Aqui os dois modelos coincidem porque a lista toda ja e conhecida no inicio,
+ninguem cria tarefa nova e o resultado e uma soma que nao influencia o que sera
+feito depois - o mestre e so um produtor conveniente, daria ate pra tirar ele e
+deixar as trabalhadoras pegarem indices de um contador compartilhado. Eles se
+separam quando:
+
+(a) Novas tarefas sao geradas durante a execucao (branch and bound, busca em
+    arvore, crawler): as trabalhadoras viram produtoras e inserem de volta na
+    sacola. O bag-of-tasks continua descrevendo bem o programa, porque a sacola
+    e passiva e nao importa quem poe e quem tira, mas o mestre-trabalhador
+    quebra: ou o mestre vira gargalo, com toda tarefa nova passando por ele, ou
+    ele deixa de ser mestre. E o criterio de termino para de funcionar, porque
+    fila vazia nao significa mais fim - uma trabalhadora ocupada pode estar
+    prestes a inserir mil tarefas. Precisaria de deteccao de termino de verdade
+    ("fila vazia e todas as trabalhadoras ociosas ao mesmo tempo").
+
+(b) O mestre precisa decidir com base em resultado parcial. Ai ele tem papel
+    proprio e os resultados precisam voltar pra ele, normalmente por uma segunda
+    fila: branch and bound onde o mestre guarda o melhor limite e redistribui
+    pra podar ramos, ou uma busca que para assim que alguem achar a resposta.
+    Nesses casos o mestre e ponto de coordenacao e possivel gargalo, e a sacola
+    sozinha nao resolve porque sacola nao decide nada.
+
+Tambem da pra ter mestre-trabalhador sem sacola: se o mestre manda a tarefa pra
+uma trabalhadora especifica (por afinidade de dado, ou porque uma thread cuida
+da GPU), nao existe pote comum, existem filas por trabalhador.
+
+Q7.
+    Threads   Estatico   Bag      Ganho do bag
+       1       54,62     53,13    2,7% (empate)
+       2       39,82     28,75    27,8% mais rapido
+       4       27,86     27,48    1,4% (empate)
+
+A linha de 2 threads mostra o efeito puro, com uma thread por nucleo: 28,75 s
+contra 39,82 s, speedup 1,90 contra 1,37 - quase o maximo possivel com 2
+nucleos. E o unico resultado das tabelas claramente acima do ruido (~10% aqui).
+Nas outras duas linhas da empate: com 1 thread nao tem o que equilibrar, e com
+4 threads em 2 nucleos o revezamento do escalonador ja fazia no estatico o
+balanceamento que o bag faz de proposito. So que o estatico so alcanca o bag
+quando recebe mais threads do que nucleos e conta com a sorte do escalonador.
+
+Custo da fila x custo da tarefa. Medi a fila num teste a parte: a mesma fila
+do ex2_bag com 1 produtor e 2 consumidores que nao fazem trabalho nenhum,
+3.276.800 pares insere+retira, entao o tempo medido e 100% sincronizacao. Deu
+0,28 a 0,36 us por par. Usando 0,3 us:
+
+    custo medio de uma tarefa = 54,62 / 32768 = 1,667 ms = 1667 us
+    custo de uma operacao na fila             =            0,3 us
+    razao                                     =        ~5600 : 1
+
+    total de sincronizacao: 32768 x 0,3 us = ~10 ms numa execucao de ~29 s, ou
+    0,03% do tempo. Desprezivel perto dos 11 s que o balanceamento economizou.
+
+Por isso acessar a fila 32.768 vezes nao e problema: o que importa nao e o
+numero de acessos, e a razao entre o custo da tarefa e o custo do acesso.
+
+Se as tarefas fossem muito mais baratas (somar dois numeros) ficaria mais lento
+que o sequencial: somar custa ~1 ns e a operacao de fila ~300 ns, entao a razao
+inverte e sao ~300x mais tempo sincronizando do que trabalhando. Alem disso
+todas as threads passariam a disputar o mesmo mutex o tempo todo, e a fila
+viraria ponto de serializacao, com as variaveis tam/inicio/tras quicando entre
+os caches dos nucleos.
+
+Se cada tarefa fosse um bloco de 8192 numeros (so 4 tarefas) voltaria a ser o
+particionamento estatico da Tabela 1, so que com uma fila no meio. O overhead
+seria ridiculo (4 acessos) mas nao sobraria nada pra balancear: cada thread
+pega uma tarefa e a sacola esvazia, entao quem pegar o bloco final (que sozinho
+custa ~26 s) define o tempo total. Balanceamento dinamico so funciona se,
+quando uma thread termina cedo, ainda tiver trabalho na sacola.
+
+Regra pratica: a tarefa tem que ser grande o bastante pra pagar a sincronizacao
+e pequena o bastante pra dar espaco de balancear.
+  - piso: custo da tarefa >= ~100 a 1000x o custo de uma operacao na fila (com
+    0,3 us, tarefas de pelo menos algumas dezenas de microssegundos);
+  - teto: numero de tarefas muito maior que o de threads, pelo menos 10x e de
+    preferencia 50-100x, porque o desbalanceamento que sobra e, no pior caso,
+    do tamanho da maior tarefa.
+Entre os dois, escolher a maior tarefa que ainda atenda o teto. Aqui sobra
+folga: 1,667 ms contra 0,3 us, e 32768 tarefas pra 4 threads. Quando nao houver
+folga, da pra retirar C tarefas por vez (chunking) ou usar lotes decrescentes,
+grandes no comeco pra amortizar e menores no fim pra balancear a cauda.
+
+Q8.
+(a) Pi por Monte Carlo: nao melhoraria, so pioraria. Toda amostra custa
+    exatamente o mesmo, sem desvio dependente do dado e sem laco de tamanho
+    variavel, entao o custo ja e conhecido antes de rodar e o estatico (cada
+    thread sorteia N/T pontos) ja da balanceamento otimo com zero
+    sincronizacao. Nao tem desperdicio pra recuperar, o bag so acrescentaria
+    overhead. Se a tarefa fosse uma amostra cairia no caso catastrofico da Q7
+    (~1 ns de trabalho contra ~300 ns de fila); se fosse um lote grande,
+    empataria pagando mutex, condicoes e tarefas FIM pra nao ganhar nada. O
+    cuidado de verdade aqui nem tem a ver com balanceamento: usar rand_r com
+    semente por thread em vez de rand(), que serializa num estado global.
+    Ressalva: se os nucleos nao forem dedicados (outros processos, nucleos
+    heterogeneos tipo P-core e E-core, queda de frequencia), o desbalanceamento
+    vem de fora do algoritmo e ai o dinamico compensa.
+
+(b) Fractal linha a linha: sim, melhoraria bastante - e estruturalmente o mesmo
+    problema dessa atividade. O custo por linha e imprevisivel pelo mesmo
+    motivo do eh_primo: cada pixel e um laco que roda ate escapar ou ate o
+    maximo de iteracoes, entao pixel fora do conjunto escapa rapido e pixel
+    dentro roda o maximo, e so da pra saber calculando. Pior, o desbalanceamento
+    estatico ai e sistematico: o Mandelbrot fica concentrado no centro da
+    imagem, entao em blocos contiguos as threads do meio pegam quase todo o
+    trabalho pesado e as das bordas terminam na hora - o mesmo padrao da Tabela
+    1. A granularidade cai certinho na regra da Q7: uma linha de 1920 pixels
+    custa de dezenas de microssegundos a alguns milissegundos, bem acima do
+    piso, e uma imagem tem centenas ou milhares de linhas. As linhas sao
+    independentes e cada uma escreve numa regiao propria do buffer, entao a
+    fila acaba sendo a unica sincronizacao do programa. Distribuicao ciclica
+    das linhas ajudaria, mas continua sendo aposta: com outro zoom a regiao
+    cara muda de lugar, e o bag nao depende de nenhuma hipotese sobre onde esta
+    o trabalho pesado.
+
+Ou seja, o bag-of-tasks compensa quando o custo das tarefas e variavel e
+imprevisivel, e quando as tarefas sao grandes o bastante pra amortizar a fila e
+numerosas o bastante pra dar espaco de balancear. O caso (b) atende as duas; o
+(a) falha na primeira, e ali o estatico e a resposta certa.

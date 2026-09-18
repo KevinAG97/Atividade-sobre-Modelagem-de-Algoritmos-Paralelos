@@ -67,13 +67,17 @@ void insere(long long v)
 {
     pthread_mutex_lock(&mutex_fila);
 
-    /* TODO (a): 1. espere enquanto a fila estiver cheia (tam == CAP_FILA),
-     *              com while + pthread_cond_wait em nao_cheia;
-     *           2. insira v no buffer circular:
-     *                itens[tras] = v;
-     *                tras = (tras + 1) % CAP_FILA;
-     *                tam++;
-     *           3. sinalize nao_vazia com pthread_cond_signal. */
+    /* (a) Enquanto não houver espaço, dorme em nao_cheia. While, não if
+     * (Q1): ao acordar a thread precisa reconferir a condição. */
+    while (tam == CAP_FILA)
+        pthread_cond_wait(&nao_cheia, &mutex_fila);
+
+    itens[tras] = v;
+    tras = (tras + 1) % CAP_FILA;
+    tam++;
+
+    /* Agora tem item: acorda uma trabalhadora que esteja esperando. */
+    pthread_cond_signal(&nao_vazia);
 
     pthread_mutex_unlock(&mutex_fila);
 }
@@ -84,13 +88,16 @@ long long retira(void)
     long long v = FIM;
     pthread_mutex_lock(&mutex_fila);
 
-    /* TODO (b): 1. espere enquanto a fila estiver vazia (tam == 0),
-     *              com while + pthread_cond_wait em nao_vazia;
-     *           2. retire o item mais antigo do buffer circular:
-     *                v = itens[inicio];
-     *                inicio = (inicio + 1) % CAP_FILA;
-     *                tam--;
-     *           3. sinalize nao_cheia com pthread_cond_signal. */
+    /* (b) Enquanto a fila estiver vazia, dorme em nao_vazia (while!). */
+    while (tam == 0)
+        pthread_cond_wait(&nao_vazia, &mutex_fila);
+
+    v = itens[inicio];
+    inicio = (inicio + 1) % CAP_FILA;
+    tam--;
+
+    /* Abriu espaço: acorda o mestre, se ele estiver esperando. */
+    pthread_cond_signal(&nao_cheia);
 
     pthread_mutex_unlock(&mutex_fila);
     return v;
@@ -116,13 +123,24 @@ void *trabalhadora(void *p)
     long long meus_primos  = 0;
     long long minhas_tarefas = 0;
 
-    /* TODO (c): em um laço:
-     *   1. retire uma tarefa da fila com retira();
-     *   2. se for o FIM, saia do laço;
-     *   3. senão, teste com eh_primo e acumule em meus_primos
-     *      (e conte a tarefa em minhas_tarefas).
-     * Depois do laço, some meus_primos ao total_primos global,
-     * protegendo a soma com mutex_total. */
+    /* (c) Pega uma tarefa, processa e volta para pegar a próxima. Quem
+     * termina antes pega mais trabalho — é o que equilibra a carga.
+     * O laço acaba quando sai o FIM. */
+    while (1) {
+        long long v = retira();
+
+        if (v == FIM)
+            break;
+
+        if (eh_primo(v))
+            meus_primos++;
+        minhas_tarefas++;
+    }
+
+    /* Uma seção crítica por thread, não uma por número testado. */
+    pthread_mutex_lock(&mutex_total);
+    total_primos += meus_primos;
+    pthread_mutex_unlock(&mutex_total);
 
     a->primos  = meus_primos;
     a->tarefas = minhas_tarefas;
